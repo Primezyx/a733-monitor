@@ -12,7 +12,7 @@
 |---|---|
 | **GPU · PowerVR** | 总利用率、2D / GEOM / 3D / CDM / RAY / GEOM2 分模块占用、频率、温度、显存、60 秒趋势 |
 | **CPU** | 总占用、每核占用率与**实时频率**、大小核分簇（6×A55 + 2×A76）、簇温度、负载均值 |
-| **内存** | 占用率、已用/总量、缓存、Swap |
+| **内存** | 占用率、已用/总量、缓存、Swap，以及**内存类型与速率**（如 `LPDDR4/4X · 3600 MT/s`） |
 | **网络** | 上下行实时速率、60 秒曲线、累计流量 |
 | **磁盘** | 按设备点选（全部 / eMMC / NVMe），各设备独立的**读、写曲线**，以及 已用 / 总容量 · 占用率 |
 
@@ -76,10 +76,22 @@ sudo dpkg -r a733-monitor
 | GPU 温度 | `/sys/class/thermal/thermal_zone4`（`gpu_thermal_zone`） |
 | 每核占用 | `/proc/stat` |
 | 每核频率 | `/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq` |
-| 内存 | `/proc/meminfo` |
+| 内存用量 | `/proc/meminfo` |
+| 内存类型 | `/proc/device-tree/compatible` → 板型查表 |
+| 内存速率 | `/sys/class/devfreq/*dmc*/cur_freq` × 2 |
 | 网络 | `/proc/net/dev` |
 | 磁盘读写 | `/proc/diskstats`（按整盘，不按分区） |
 | 磁盘容量 | `statvfs()` |
+
+## 支持机型
+
+| 板型（devicetree） | 内存类型 |
+|---|---|
+| `radxa,cubie-a7z` | LPDDR4/4X |
+| `radxa,cubie-a7a` | LPDDR5 |
+
+内存类型在 sysfs 里没有直接暴露。这里的做法是：读 `/proc/device-tree/compatible` 判断板型，
+再查上表；DRAM 数据率由 DMC 时钟 × 2 得出。换成未知板型时该行会自动隐藏，不会显示错误值。
 
 ## 已知限制
 

@@ -64,6 +64,32 @@ def tz(z):
     v = rd(f"/sys/class/thermal/thermal_zone{z}/temp")
     return int(v) / 1000.0 if v else None
 
+RAM_TYPE = {
+    "radxa,cubie-a7z": "LPDDR4/4X",
+    "radxa,cubie-a7a": "LPDDR5",
+}
+
+def ram_info():
+    """返回 (内存类型, 数据传输率) —— 类型按设备树板型查表，速率取 DMC 时钟×2"""
+    typ = ""
+    try:
+        with open("/proc/device-tree/compatible", "rb") as f:
+            comps = f.read().decode("utf-8", "ignore").strip("\0").split("\0")
+        typ = next((RAM_TYPE[c] for c in comps if c in RAM_TYPE), "")
+    except OSError:
+        pass
+    mt = ""
+    try:
+        for d in os.listdir("/sys/class/devfreq"):
+            if "dmc" in d:
+                v = rd(f"/sys/class/devfreq/{d}/cur_freq")
+                if v:
+                    mt = f"{int(v) / 1e6 * 2:.0f} MT/s"
+                break
+    except OSError:
+        pass
+    return typ, mt
+
 def gpu():
     try:
         with open(GPU_JSON) as f:
@@ -177,7 +203,7 @@ class Mon:
             cores=cores, cpu_pct=cpu_pct, mem=meminfo(), dn=dn / dt, up=up / dt,
             net_tot=(sum(v[0] for k, v in nb.items() if k != "lo"),
                      sum(v[1] for k, v in nb.items() if k != "lo")),
-            drd=drd, dwr=dwr, gpu=g, freq=freqs(), dev=dev_rate,
+            drd=drd, dwr=dwr, gpu=g, freq=freqs(), dev=dev_rate, ram=ram_info(),
         )
 
     def tick(self):
@@ -303,6 +329,10 @@ class Mon:
                       text=f"缓存 {m.get('Cached',0)/1048576:.1f} GB · 可用 {avail_/1048576:.1f} GB")
         c.create_text(x + 16, y2 + 144, anchor="nw", fill=DIM, font=(F, 8),
                       text=f"Swap {(sw_t-sw_f)/1048576:.1f}/{sw_t/1048576:.1f} GB")
+        ram_typ, ram_mt = d.get("ram", ("", ""))
+        if ram_typ or ram_mt:
+            c.create_text(x + 16, y2 + h3 - 22, anchor="nw", fill=CYAN, font=(F, 9, "bold"),
+                          text=f"{ram_typ}{' · ' if ram_typ and ram_mt else ''}{ram_mt}")
         # ---------- 网络 ----------
         x = M + w3 + G
         self.card(x, y2, w3, h3, "网络 · wlan0")
