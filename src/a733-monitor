@@ -221,7 +221,7 @@ class Mon:
         full = W - 2 * M
         half = (full - G) / 2
         # ---------- GPU ----------
-        gx, gy, gw, gh = M, top, full, r1
+        gx, gy, gw, gh = M, top + r1 + G, full, r2
         g = d["gpu"]
         st = "Rogue DDK 正常" if g else "采样服务未运行"
         self.card(gx, gy, gw, gh, "GPU · PowerVR", st)
@@ -248,7 +248,7 @@ class Mon:
             c.create_text(gx + 16, gy + 50, anchor="nw", fill=ORANGE, font=(F, 11),
                           text="需要 GPU 采样服务：sudo systemctl start a733-monitor")
         # ---------- CPU (整行, 每核一列) ----------
-        x, y, w, h = M, top + r1 + G, full, r2
+        x, y, w, h = M, top, full, r1
         tl, tb = tz(0), tz(1)
         sub = f"A55 {tl:.0f}°C · A76 {tb:.0f}°C" if tl and tb else ""
         self.card(x, y, w, h, f"CPU · {len(d['cores'])} 核 · 6×A55 + 2×A76", sub)
