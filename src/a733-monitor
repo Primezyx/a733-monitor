@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""A733 系统监视器 — GPU(PowerVR)/CPU/内存/网络/磁盘"""
+import json, os, socket, time, tkinter as tk
+from collections import deque
+
+GPU_JSON = "/run/a733-monitor/gpu.json"
+BG, CARD, CARD2 = "#101218", "#191c24", "#232833"
+FG, DIM, DIM2 = "#e9ecf4", "#8a93a8", "#5b6373"
+CYAN, GREEN, ORANGE, RED = "#45c8ff", "#4fd18b", "#f5a45d", "#f2635f"
+BARBG, LINE = "#2b3240", "#2e3442"
+F = "DejaVu Sans"
+
+def rd(p, d=None):
+    try:
+        with open(p) as f:
+            return f.read()
+    except OSError:
+        return d
+
+def cpu_times():
+    out = {}
+    for ln in (rd("/proc/stat", "") or "").splitlines():
+        if not ln.startswith("cpu") or ln.startswith("cpu "):
+            continue
+        p = ln.split()
+        v = [int(x) for x in p[1:]]
+        out[p[0]] = (sum(v), v[3] + (v[4] if len(v) > 4 else 0))
+    return out
+
+def meminfo():
+    d = {}
+    for ln in (rd("/proc/meminfo", "") or "").splitlines():
+        k, v, *_ = ln.split()
+        d[k.rstrip(":")] = int(v)
+    return d
+
+def net_bytes():
+    d = {}
+    for ln in (rd("/proc/net/dev", "") or "").splitlines()[2:]:
+        if ":" not in ln:
+            continue
+        i, rest = ln.split(":", 1)
+        f = rest.split()
+        d[i.strip()] = (int(f[0]), int(f[8]))
+    return d
+
+def disk_bytes():
+    d = {}
+    for ln in (rd("/proc/diskstats", "") or "").splitlines():
+        f = ln.split()
+        if len(f) >= 14 and f[2] in ("mmcblk0", "nvme0n1"):
+            d[f[2]] = (int(f[5]) * 512, int(f[9]) * 512)
+    return d
+
+def freqs():
+    o = []
+    for i in range(os.cpu_count() or 0):
+        v = rd(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq")
+        if v:
+            o.append(int(v) / 1000.0)
+    return o
+
+def tz(z):
+    v = rd(f"/sys/class/thermal/thermal_zone{z}/temp")
+    return int(v) / 1000.0 if v else None
+
+def gpu():
+    try:
+        with open(GPU_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def hb(n):
+    for u, s in ((1 << 40, "T"), (1 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")):
+        if n >= u:
+            return f"{n/u:.1f}{s}B"
+    return f"{n:.0f}B"
+
+def rate(n):
+    return hb(n) + "/s"
+
+def rrect(c, x1, y1, x2, y2, r=10, **kw):
+    pts = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y2-r, x2, y2,
+           x2-r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y1+r, x1, y1]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+def bar(c, x, y, w, h, frac, col):
+    frac = max(0.0, min(1.0, frac))
+    rrect(c, x, y, x + w, y + h, h / 2, fill=BARBG, outline="")
+    if frac > 0.001:
+        rrect(c, x, y, x + max(h, w * frac), y + h, h / 2, fill=col, outline="")
+
+def spark(c, vals, x, y, w, h, col):
+    c.create_line(x, y + h, x + w, y + h, fill=LINE)
+    if len(vals) < 2:
+        return
+    mx = max(max(vals), 1e-9)
+    n = len(vals)
+    pts = []
+    for i, v in enumerate(vals):
+        px = x + w * i / (n - 1)
+        py = y + h - (v / mx) * h
+        pts += [px, py]
+    c.create_line(*pts, fill=col, width=2, smooth=False)
+    c.create_line(pts[-2], pts[-1], x + w, y + h, x + w, y + h, fill="", width=0)
+
+class Mon:
+    def __init__(self, root):
+        self.root = root
+        root.title("A733 系统监视器")
+        root.geometry("980x780")
+        root.minsize(720, 560)
+        root.configure(bg=BG)
+        self.c = tk.Canvas(root, bg=BG, highlightthickness=0)
+        self.c.pack(fill="both", expand=True)
+        self.h_gpu = deque([0] * 60, maxlen=60)
+        self.h_cpu = deque([0] * 60, maxlen=60)
+        self.h_dn = deque([0] * 60, maxlen=60)
+        self.h_up = deque([0] * 60, maxlen=60)
+        self.sel = 0
+        self.hits = []
+        self.h_rd, self.h_wr = {}, {}
+        self.c.bind("<Button-1>", self.onclick)
+        self.prev = {}
+        self.prevt = time.time()
+        self.prev_cpu = cpu_times()
+        self.prev_net = net_bytes()
+        self.prev_disk = disk_bytes()
+        self.tick()
+
+    def sample(self):
+        now = time.time()
+        dt = max(now - self.prevt, 1e-3)
+        self.prevt = now
+        # cpu
+        cur = cpu_times()
+        cores, tot_busy, tot_all = [], 0, 0
+        for k in sorted(cur, key=lambda s: int(s[3:])):
+            t1, i1 = cur[k]
+            t0, i0 = self.prev_cpu.get(k, (t1, i1))
+            dt_, di = t1 - t0, i1 - i0
+            p = 0.0 if dt_ <= 0 else 100.0 * (1 - di / dt_)
+            cores.append(max(0.0, min(100.0, p)))
+            tot_all += dt_
+            tot_busy += dt_ - di
+        self.prev_cpu = cur
+        cpu_pct = 0.0 if tot_all <= 0 else 100.0 * tot_busy / tot_all
+        # net
+        nb = net_bytes()
+        dn = up = 0
+        for i, (rx, tx) in nb.items():
+            if i == "lo":
+                continue
+            prx, ptx = self.prev_net.get(i, (rx, tx))
+            dn += max(0, rx - prx)
+            up += max(0, tx - ptx)
+        self.prev_net = nb
+        # disk
+        db = disk_bytes()
+        drd = dwr = 0
+        dev_rate = {}
+        for i, (r, w) in db.items():
+            pr, pw = self.prev_disk.get(i, (r, w))
+            rr, ww = max(0, r - pr) / dt, max(0, w - pw) / dt
+            dev_rate[i] = (rr, ww)
+            drd += rr
+            dwr += ww
+        dev_rate["all"] = (drd, dwr)
+        self.prev_disk = db
+        self.h_cpu.append(cpu_pct)
+        self.h_dn.append(dn / dt)
+        self.h_up.append(up / dt)
+        g = gpu()
+        self.h_gpu.append(g["util"] if g else 0)
+        self.data = dict(
+            cores=cores, cpu_pct=cpu_pct, mem=meminfo(), dn=dn / dt, up=up / dt,
+            net_tot=(sum(v[0] for k, v in nb.items() if k != "lo"),
+                     sum(v[1] for k, v in nb.items() if k != "lo")),
+            drd=drd, dwr=dwr, gpu=g, freq=freqs(), dev=dev_rate,
+        )
+
+    def tick(self):
+        try:
+            self.sample()
+            self.draw()
+        except Exception as e:
+            self.c.delete("all")
+            self.c.create_text(20, 20, text=f"err: {e}", fill=RED, anchor="nw")
+        self.root.after(1000, self.tick)
+
+    def card(self, x, y, w, h, title, sub=""):
+        rrect(self.c, x, y, x + w, y + h, 12, fill=CARD, outline=LINE)
+        self.c.create_text(x + 16, y + 14, text=title, anchor="nw",
+                           fill=DIM, font=(F, 10, "bold"))
+        if sub:
+            self.c.create_text(x + w - 16, y + 14, text=sub, anchor="ne",
+                               fill=DIM2, font=(F, 9))
+
+    def draw(self):
+        c, d = self.c, self.data
+        c.delete("all")
+        W = c.winfo_width() or 960
+        H = c.winfo_height() or 700
+        M, G = 18, 14
+        hh = 46
+        # header
+        c.create_text(M, M, text="系统监视器", anchor="nw", fill=FG,
+                      font=(F, 16, "bold"))
+        up = float((rd("/proc/uptime", "0").split() or ["0"])[0])
+        ud = int(up) // 86400
+        uh = (int(up) % 86400) // 3600
+        um = (int(up) % 3600) // 60
+        c.create_text(M + 118, M + 6, text=f"{socket.gethostname()} · "
+                      f"运行 {ud}天{uh}时{um}分", anchor="nw", fill=DIM, font=(F, 10))
+        c.create_text(W - M, M + 4, text=time.strftime("%H:%M:%S"), anchor="ne",
+                      fill=CYAN, font=(F, 16, "bold"))
+        top = M + hh
+        avail = H - top - M - 3 * G
+        r1, r2, r3 = avail * .30, avail * .30, avail * .40
+        full = W - 2 * M
+        half = (full - G) / 2
+        # ---------- GPU ----------
+        gx, gy, gw, gh = M, top, full, r1
+        g = d["gpu"]
+        st = "Rogue DDK 正常" if g else "采样服务未运行"
+        self.card(gx, gy, gw, gh, "GPU · PowerVR", st)
+        if g:
+            c.create_text(gx + 16, gy + 44, text=f"{g['util']:.0f}", anchor="nw",
+                          fill=CYAN, font=(F, 40, "bold"))
+            c.create_text(gx + 16 + 62, gy + 62, text="%", anchor="nw",
+                          fill=DIM, font=(F, 14, "bold"))
+            c.create_text(gx + 110, gy + 48, anchor="nw", fill=FG, font=(F, 11),
+                          text=f"{g['clock']:.0f} MHz   {g['temp']:.1f} °C   "
+                               f"VRAM {g['vram']:.0f} MB")
+            bx, bw = gx + 110, gw - 126
+            for i, (k, lbl) in enumerate([("2d", "2D"), ("geom", "GEOM"), ("3d", "3D"),
+                                          ("cdm", "CDM"), ("ray", "RAY"), ("geom2", "G2")]):
+                x = bx + i * (bw / 6)
+                v = g.get(k, 0)
+                c.create_text(x, gy + 74, text=lbl, anchor="nw", fill=DIM2, font=(F, 8))
+                bar(c, x, gy + 88, bw / 6 - 10, 7, v / 100.0, ORANGE if k == "3d" else CYAN)
+                c.create_text(x, gy + 100, text=f"{v:.0f}%", anchor="nw", fill=DIM, font=(F, 8))
+            c.create_text(gx + 16, gy + 116, text="利用率趋势 · 最近 60 秒", anchor="nw",
+                          fill=DIM2, font=(F, 8))
+            spark(c, list(self.h_gpu), gx + 16, gy + 132, gw - 32, gh - 150, CYAN)
+        else:
+            c.create_text(gx + 16, gy + 50, anchor="nw", fill=ORANGE, font=(F, 11),
+                          text="需要 GPU 采样服务：sudo systemctl start a733-monitor")
+        # ---------- CPU (整行, 每核一列) ----------
+        x, y, w, h = M, top + r1 + G, full, r2
+        tl, tb = tz(0), tz(1)
+        sub = f"A55 {tl:.0f}°C · A76 {tb:.0f}°C" if tl and tb else ""
+        self.card(x, y, w, h, f"CPU · {len(d['cores'])} 核 · 6×A55 + 2×A76", sub)
+        tot_col = GREEN if d["cpu_pct"] < 60 else ORANGE if d["cpu_pct"] < 85 else RED
+        c.create_text(x + 16, y + 40, text=f"{d['cpu_pct']:.0f}", anchor="nw",
+                      fill=tot_col, font=(F, 30, "bold"))
+        c.create_text(x + 16 + 50, y + 54, text="%", anchor="nw", fill=DIM,
+                      font=(F, 12, "bold"))
+        la = (rd("/proc/loadavg", "") or "").split()[:3]
+        c.create_text(x + 16, y + 88, anchor="nw", fill=FG, font=(F, 9),
+                      text=f"负载 {' '.join(la) if la else '-'}")
+        c.create_text(x + 16, y + 106, anchor="nw", fill=DIM2, font=(F, 8),
+                      text="每核: 占用% · 频率 MHz · 编号")
+        n = len(d["cores"])
+        x0 = x + 210
+        cw = (w - 226) / max(n, 1)
+        base = y + h - 42
+        for i, pct in enumerate(d["cores"]):
+            f_ = d["freq"][i] if i < len(d["freq"]) else 0
+            big = i >= 6
+            cx = x0 + i * cw
+            col = GREEN if pct < 60 else ORANGE if pct < 85 else RED
+            c.create_text(cx + cw / 2 - 4, y + 40, text=f"{pct:.0f}%", anchor="n",
+                          fill=col, font=(F, 9, "bold"))
+            bw = cw - 14
+            rrect(c, cx, base - 78, cx + bw, base, 4,
+                  fill=CARD2 if not big else "#2a2418", outline="")
+            fh = 76 * pct / 100.0
+            if fh > 1.5:
+                rrect(c, cx, base - fh, cx + bw, base, 4, fill=col, outline="")
+            c.create_text(cx + bw / 2, base + 10, text=str(i), anchor="n",
+                          fill=FG if big else DIM, font=(F, 8, "bold"))
+            c.create_text(cx + bw / 2, base + 24, text=f"{f_:.0f}", anchor="n",
+                          fill=CYAN, font=(F, 8, "bold" if big else "normal"))
+        # ---------- 内存 ----------
+        x, y2, w3, h3 = M, top + r1 + r2 + 2 * G, (full - 2 * G) / 3, r3
+        self.card(x, y2, w3, h3, "内存")
+        m = d["mem"]
+        tot = m.get("MemTotal", 1)
+        avail_ = m.get("MemAvailable", 0)
+        used = tot - avail_
+        pct = 100.0 * used / tot if tot else 0
+        c.create_text(x + 16, y2 + 38, text=f"{pct:.0f}", anchor="nw", fill=ORANGE,
+                      font=(F, 30, "bold"))
+        c.create_text(x + 16 + 50, y2 + 52, text="%", anchor="nw", fill=DIM,
+                      font=(F, 12, "bold"))
+        c.create_text(x + 16, y2 + 80, anchor="nw", fill=FG, font=(F, 9),
+                      text=f"{used/1048576:.1f} / {tot/1048576:.1f} GB")
+        bar(c, x + 16, y2 + 100, w3 - 32, 12, pct / 100.0, ORANGE)
+        sw_t, sw_f = m.get("SwapTotal", 0), m.get("SwapFree", 0)
+        c.create_text(x + 16, y2 + 126, anchor="nw", fill=DIM, font=(F, 8),
+                      text=f"缓存 {m.get('Cached',0)/1048576:.1f} GB · 可用 {avail_/1048576:.1f} GB")
+        c.create_text(x + 16, y2 + 144, anchor="nw", fill=DIM, font=(F, 8),
+                      text=f"Swap {(sw_t-sw_f)/1048576:.1f}/{sw_t/1048576:.1f} GB")
+        # ---------- 网络 ----------
+        x = M + w3 + G
+        self.card(x, y2, w3, h3, "网络 · wlan0")
+        c.create_text(x + 16, y2 + 38, anchor="nw", fill=GREEN, font=(F, 15, "bold"),
+                      text=f"↓ {rate(d['dn'])}")
+        c.create_text(x + 16, y2 + 64, anchor="nw", fill=CYAN, font=(F, 13, "bold"),
+                      text=f"↑ {rate(d['up'])}")
+        spark(c, list(self.h_dn), x + 16, y2 + 88, w3 - 32, max(24, h3 - 116), GREEN)
+        c.create_text(x + 16, y2 + h3 - 18, anchor="nw", fill=DIM2, font=(F, 8),
+                      text=f"累计 ↓{hb(d['net_tot'][0])}  ↑{hb(d['net_tot'][1])}")
+        # ---------- 磁盘（可点选设备） ----------
+        x = M + 2 * (w3 + G)
+        mounts = [(m, dv) for m, dv in (("/", "mmcblk0"), ("/media/radxa/BG4", "nvme0n1"))
+                  if os.path.ismount(m)]
+        stats, tot_u, tot_t = {}, 0, 0
+        for mnt, _dv in mounts:
+            try:
+                st = os.statvfs(mnt)
+                t = st.f_blocks * st.f_frsize
+                u = t - st.f_bavail * st.f_frsize
+            except OSError:
+                continue
+            stats[mnt] = (u, t)
+            tot_u += u
+            tot_t += t
+        self.card(x, y2, w3, h3, "磁盘 · 点击选择设备", f"总容量 {hb(tot_t)}")
+        rows = [("全部设备", None)] + mounts
+        if self.sel >= len(rows):
+            self.sel = 0
+        self.hits = []
+        ry = y2 + 34
+        for idx, (lbl, dev) in enumerate(rows):
+            act = idx == self.sel
+            se = "all" if dev is None else dev
+            u, t = (tot_u, tot_t) if dev is None else stats.get(lbl, (0, 0))
+            pp = 100.0 * u / t if t else 0
+            rrect(self.c, x + 10, ry - 2, x + w3 - 10, ry + 22, 5,
+                  fill="#26303f" if act else CARD, outline=CYAN if act else "")
+            self.c.create_text(x + 17, ry + 1, text=lbl, anchor="nw",
+                               fill=FG if act else DIM, font=(F, 8, "bold"))
+            self.c.create_text(x + w3 - 17, ry + 1, anchor="ne",
+                               fill=FG if act else DIM, font=(F, 7),
+                               text=f"{hb(u)}/{hb(t)} · {pp:.0f}%")
+            bar(self.c, x + 17, ry + 14, w3 - 44, 4, pp / 100.0,
+                RED if pp > 85 else ORANGE if pp > 70 else GREEN)
+            self.hits.append((ry - 2, ry + 22, idx, se))
+            ry += 26
+        se = self.hits[self.sel][3] if self.hits else "all"
+        rr, wr = d["dev"].get(se, (0, 0))
+        for arr in (self.h_rd, self.h_wr):
+            arr.setdefault(se, deque([0] * 60, maxlen=60))
+        self.h_rd[se].append(rr)
+        self.h_wr[se].append(wr)
+        cy = ry + 2
+        ch = max(12, (y2 + h3 - cy - 12 - 44) / 2)
+        for lbl, val, col, hist in (("读", rr, GREEN, self.h_rd[se]),
+                                    ("写", wr, ORANGE, self.h_wr[se])):
+            self.c.create_text(x + 16, cy, text=lbl, anchor="nw", fill=DIM, font=(F, 8))
+            self.c.create_text(x + 34, cy - 2, text=rate(val), anchor="nw", fill=col,
+                               font=(F, 10, "bold"))
+            spark(self.c, list(hist), x + 16, cy + 15, w3 - 32, ch, col)
+            cy += ch + 22
+
+    def onclick(self, ev):
+        for y1, y2_, idx, _ in self.hits:
+            if y1 <= ev.y <= y2_:
+                self.sel = idx
+                self.draw()
+                return
+
+if __name__ == "__main__":
+    r = tk.Tk(className="a733-monitor")
+    if os.environ.get("A733_TOPMOST"):
+        r.attributes("-topmost", True)
+    Mon(r)
+    r.mainloop()

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=A733 系统监视器
+Name[en]=A733 Monitor
+Comment=GPU / CPU / 内存 / 网络 / 磁盘 实时监控
+Comment[en]=Real-time GPU, CPU, memory, network and disk monitor
+Exec=/usr/bin/a733-monitor
+Icon=a733-monitor
+Terminal=false
+StartupWMClass=a733-monitor
+Categories=System;Monitor;
+Keywords=monitor;gpu;cpu;memory;network;disk;
