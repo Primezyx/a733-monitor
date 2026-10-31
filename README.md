@@ -13,7 +13,7 @@
 | **GPU · PowerVR** | 总利用率、2D / GEOM / 3D / CDM / RAY / GEOM2 分模块占用、频率、温度、显存、60 秒趋势 |
 | **CPU** | 总占用、每核占用率与**实时频率**、大小核分簇（6×A55 + 2×A76）、簇温度、负载均值 |
 | **内存** | 占用率、已用/总量、缓存、Swap，以及**内存类型与速率**（如 `LPDDR4/4X · 3600 MT/s`） |
-| **网络** | 上下行实时速率、60 秒曲线、累计流量 |
+| **网络** | 上下行实时速率、60 秒曲线、累计流量；Wi-Fi **协议版本 / 频段 / 信道带宽 / 协商速率 / 信号强度**、SSID |
 | **磁盘** | 按设备点选（全部 / eMMC / NVMe），各设备独立的**读、写曲线**，以及 已用 / 总容量 · 占用率 |
 
 ## 为什么需要一个小服务
@@ -79,7 +79,8 @@ sudo dpkg -r a733-monitor
 | 内存用量 | `/proc/meminfo` |
 | 内存类型 | `/proc/device-tree/compatible` → 板型查表 |
 | 内存速率 | `/sys/class/devfreq/*dmc*/cur_freq` × 2 |
-| 网络 | `/proc/net/dev` |
+| 网络流量 | `/proc/net/dev` |
+| 无线链路 | `/sbin/iw dev wlan0 link`（协议版本、频段、带宽、协商速率、RSSI） |
 | 磁盘读写 | `/proc/diskstats`（按整盘，不按分区） |
 | 磁盘容量 | `statvfs()` |
 
@@ -97,6 +98,8 @@ sudo dpkg -r a733-monitor
 
 - **每核温度拿不到**：芯片只有 4 个温度 sensor（小核簇、大核簇各一 + 两个 idle zone），
   没有 per-core 传感器，所以温度只能精确到「簇」。
+- **无线信息依赖 `iw`**：多数发行版自带（Debian 在 `/sbin/iw`，普通用户 PATH 里可能没有，
+  程序用绝对路径调用）。缺少 `iw` 或网卡不是无线时，这几行会自动隐藏。
 - **浏览器视频硬解不可用**：板子有 VPU（`/dev/cedar_dev` + `sunxi_ve`），但系统没有 VA-API 驱动、
   也没有 V4L2 解码节点，Firefox/Chromium 无法对接；厂商只提供 Cedar + GStreamer(OpenMAX) 通路。
 - GPU 利用率依赖厂商 PowerVR 驱动，换内核或换 SoC 后 debugfs 路径可能不同。

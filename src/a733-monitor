@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A733 系统监视器 — GPU(PowerVR)/CPU/内存/网络/磁盘"""
-import json, os, socket, time, tkinter as tk
+import json, os, re, socket, subprocess, time, tkinter as tk
 from collections import deque
 
 GPU_JSON = "/run/a733-monitor/gpu.json"
@@ -96,6 +96,55 @@ def gpu():
             return json.load(f)
     except Exception:
         return None
+
+_wifi_cache = {"t": 0.0, "v": None}
+
+def wifi_info(iface="wlan0"):
+    """解析 iw 输出：协议版本、频段、带宽、协商速率、信号"""
+    now = time.time()
+    if now - _wifi_cache["t"] < 3 and _wifi_cache["v"] is not None:
+        return _wifi_cache["v"]
+    info = None
+    try:
+        out = subprocess.run(["/sbin/iw", "dev", iface, "link"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        out = ""
+    if "Connected to" in out:
+        f = re.search(r"freq:\s*(\d+)", out)
+        sg = re.search(r"signal:\s*(-?\d+)", out)
+        tx = re.search(r"tx bitrate:\s*([\d.]+)\s*MBit/s(.*)", out)
+        ss = re.search(r"SSID:\s*(.+)", out)
+        freq = int(f.group(1)) if f else 0
+        if freq >= 5925:
+            band = "6 GHz"
+        elif freq >= 3000:
+            band = "5 GHz"
+        else:
+            band = "2.4 GHz"
+        phy = ""
+        width = ""
+        rate = 0.0
+        if tx:
+            tail = tx.group(2)
+            rate = float(tx.group(1))
+            if "EHT" in tail:
+                phy = "Wi-Fi 7"
+            elif "VHT" in tail:
+                phy = "Wi-Fi 5"
+            elif "HE" in tail:
+                phy = "Wi-Fi 6"
+            elif "HT" in tail:
+                phy = "Wi-Fi 4"
+            mw = re.search(r"(\d+)MHz", tail)
+            if mw:
+                width = mw.group(1) + " MHz"
+        info = dict(ssid=(ss.group(1).strip() if ss else ""), band=band, phy=phy,
+                    width=width, rate=rate,
+                    rssi=(int(sg.group(1)) if sg else 0), freq=freq)
+    _wifi_cache["t"] = now
+    _wifi_cache["v"] = info
+    return info
 
 def hb(n):
     for u, s in ((1 << 40, "T"), (1 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")):
@@ -203,7 +252,7 @@ class Mon:
             cores=cores, cpu_pct=cpu_pct, mem=meminfo(), dn=dn / dt, up=up / dt,
             net_tot=(sum(v[0] for k, v in nb.items() if k != "lo"),
                      sum(v[1] for k, v in nb.items() if k != "lo")),
-            drd=drd, dwr=dwr, gpu=g, freq=freqs(), dev=dev_rate, ram=ram_info(),
+            drd=drd, dwr=dwr, gpu=g, freq=freqs(), dev=dev_rate, ram=ram_info(), wifi=wifi_info(),
         )
 
     def tick(self):
@@ -335,13 +384,28 @@ class Mon:
                           text=f"{ram_typ}{' · ' if ram_typ and ram_mt else ''}{ram_mt}")
         # ---------- 网络 ----------
         x = M + w3 + G
-        self.card(x, y2, w3, h3, "网络 · wlan0")
-        c.create_text(x + 16, y2 + 38, anchor="nw", fill=GREEN, font=(F, 15, "bold"),
+        wf = d.get("wifi")
+        sub = ""
+        if wf:
+            sub = " · ".join(p for p in (wf["phy"], wf["band"], wf["width"]) if p)
+        self.card(x, y2, w3, h3, "网络 · wlan0", sub)
+        ty = y2 + 34
+        if wf and wf["ssid"]:
+            c.create_text(x + 16, ty, anchor="nw", fill=DIM, font=(F, 8),
+                          text=wf["ssid"][:26])
+            ty += 16
+        c.create_text(x + 16, ty + 2, anchor="nw", fill=GREEN, font=(F, 15, "bold"),
                       text=f"↓ {rate(d['dn'])}")
-        c.create_text(x + 16, y2 + 64, anchor="nw", fill=CYAN, font=(F, 13, "bold"),
+        c.create_text(x + 16, ty + 28, anchor="nw", fill=CYAN, font=(F, 13, "bold"),
                       text=f"↑ {rate(d['up'])}")
-        spark(c, list(self.h_dn), x + 16, y2 + 88, w3 - 32, max(24, h3 - 116), GREEN)
-        c.create_text(x + 16, y2 + h3 - 18, anchor="nw", fill=DIM2, font=(F, 8),
+        ty += 54
+        if wf and wf["rate"]:
+            c.create_text(x + 16, ty, anchor="nw", fill=FG, font=(F, 9),
+                          text=f"链路 {wf['rate']:.0f} Mbps · {wf['rssi']} dBm")
+            ty += 18
+        spark(c, list(self.h_dn), x + 16, ty + 4, w3 - 32,
+              max(20, y2 + h3 - ty - 30), GREEN)
+        c.create_text(x + 16, y2 + h3 - 16, anchor="nw", fill=DIM2, font=(F, 8),
                       text=f"累计 ↓{hb(d['net_tot'][0])}  ↑{hb(d['net_tot'][1])}")
         # ---------- 磁盘（可点选设备） ----------
         x = M + 2 * (w3 + G)
